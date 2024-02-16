@@ -63,7 +63,7 @@ func main() {
 	defer session.Close()
 
 	//инициализация бота
-	bot, err := tgbotapi.NewBotAPI("6904018802:AAHC2WDBPW4za575perboin2mr1LNKq2ZV4")
+	bot, err := tgbotapi.NewBotAPI("BOT_TOKEN")
 	if err != nil {
 		log.Fatal(err)
 	}

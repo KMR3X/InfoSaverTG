@@ -1,12 +1,18 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
+	//"fmt"
 	"log"
-	"os"
+	"strconv"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	gocql "github.com/gocql/gocql"
+	gocqlx "github.com/scylladb/gocqlx"
+
+	qb "github.com/scylladb/gocqlx/qb"
+	table "github.com/scylladb/gocqlx/table"
+	zap "go.uber.org/zap"
 )
 
 type UserExistence struct {
@@ -22,14 +28,45 @@ type UserInfoFS struct {
 	LanguageCode string `json:"language_code,omitempty"`
 }
 
+type query struct {
+	stmt  string
+	names []string
+}
+
+type statements struct {
+	del query
+	ins query
+	sel query
+}
+
+type Record struct {
+	ID           string `db:"id"`
+	IsBot        string `db:"is_bot"`
+	FirstName    string `db:"first_name"`
+	LastName     string `db:"last_name"`
+	UserName     string `db:"user_name"`
+	LanguageCode string `db:"language_code"`
+}
+
 func main() {
+	//параметры запуска контейнера:
+	//docker run --name node1 -p 9042:9042 -d scylladb/scylla --broadcast-address 127.0.0.1 --listen-address 0.0.0.0 --broadcast-rpc-address 127.0.0.1
+
+	logger := zap.NewExample()
+
+	//инициализация кластера, сессии и подключение к бд
+	cluster := CreateCluster(gocql.Quorum, "is_3000", "127.0.0.1")
+	session, err := gocql.NewSession(*cluster)
+	if err != nil {
+		logger.Fatal("Ошибка подключения", zap.Error(err))
+	}
+	defer session.Close()
+
 	//инициализация бота
 	bot, err := tgbotapi.NewBotAPI("6904018802:AAHC2WDBPW4za575perboin2mr1LNKq2ZV4")
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	//bot.Debug = true
 
 	//Информация о владельце
 	log.Printf("Запуск бота %s", bot.Self.UserName)
@@ -52,12 +89,12 @@ func main() {
 		//Вывод в лог отправленного пользователем сообщения
 		log.Printf("[%s] %s", update.Message.From.UserName, update.Message.Text)
 
-		//Сохранение информации
-		if CheckUser(update.Message) == false {
-			SaveInfo(update.Message)
-			msgText = "Информация успешно сохранена! "
-		} else {
+		//Проверка на наличие пользователя в бд, если нет - сохранение его данных
+		if selectQuery(session, logger, int(update.Message.From.ID)) == true {
 			msgText = "Такой пользователь уже существует. "
+		} else {
+			SaveInfoDB(session, logger, update.Message)
+			msgText = "Информация успешно сохранена! "
 		}
 
 		//Отправка сообщения в тот же чат
@@ -65,74 +102,102 @@ func main() {
 	}
 }
 
-func CheckUser(message *tgbotapi.Message) bool {
-	//var userIDslice []int64
+var stmts = createStatements()
 
-	//Открытие и отложенное закрытие файла
-	saveFile, err := os.Open("savedInfo.txt")
-	if err != nil {
-		log.Fatal(err)
+// создание выражений для работы с бд
+func createStatements() *statements {
+	//задание схемы таблицы
+	m := table.Metadata{
+		Name:    "users",
+		Columns: []string{"id", "is_bot", "first_name", "last_name", "user_name", "language_code"},
+		PartKey: []string{"id"},
 	}
-	defer saveFile.Close()
+	tbl := table.New(m)
 
-	//Сканнер для чтения и объект типа UserExistence
-	sc := bufio.NewScanner(saveFile)
-	var ue UserExistence
+	//Методы работы с данными
+	deleteStmt, deleteNames := tbl.Delete()
+	insertStmt, insertNames := tbl.Insert()
+	selectStmt, selectNames := qb.Select(m.Name).Columns(m.Columns...).ToCql()
 
-	//Чтение файла, выделение поля ID, сверка с ID отправившего сообщение
-	for sc.Scan() {
-		//fmt.Printf("%s\n", sc.Text())
-		data := []byte(sc.Text())
+	return &statements{
+		del: query{
+			stmt:  deleteStmt,
+			names: deleteNames,
+		},
+		ins: query{
+			stmt:  insertStmt,
+			names: insertNames,
+		},
+		sel: query{
+			stmt:  selectStmt,
+			names: selectNames,
+		},
+	}
+}
 
-		//пустой файл
-		if len(data) == 0 {
-			return false
-		}
+// Создание кластера бд
+func CreateCluster(consistency gocql.Consistency, keyspace string, hosts ...string) *gocql.ClusterConfig {
+	retryPolicy := &gocql.ExponentialBackoffRetryPolicy{
+		Min:        time.Second,
+		Max:        10 * time.Second,
+		NumRetries: 5,
+	}
+	cluster := gocql.NewCluster(hosts...)
+	cluster.Keyspace = keyspace
+	cluster.Timeout = 5 * time.Second
+	cluster.RetryPolicy = retryPolicy
+	cluster.Consistency = consistency
+	cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.RoundRobinHostPolicy())
+	return cluster
+}
 
-		//конвертация из json в string, присваивание ID прочитанного в созданный объект
-		if err := json.Unmarshal(data, &ue); err != nil {
-			log.Fatal(err)
-		}
+// Запрос на вставку
+func insertQuery(session *gocql.Session, id, isbot, firstname, lastName, username, languagecode string, logger *zap.Logger) {
+	logger.Info("Вставка " + id + "......")
 
-		//если такой пользователь уже записан, то заново не создается
-		if ue.ID == message.From.ID {
+	r := Record{
+		ID:           id,
+		IsBot:        isbot,
+		FirstName:    firstname,
+		LastName:     lastName,
+		UserName:     username,
+		LanguageCode: languagecode,
+	}
+
+	err := gocqlx.Query(session.Query(stmts.ins.stmt), stmts.ins.names).BindStruct(r).ExecRelease()
+	if err != nil {
+		logger.Error("insert is_3000.users", zap.Error(err))
+	}
+}
+
+// Запрос показа данных
+func selectQuery(session *gocql.Session, logger *zap.Logger, id int) bool {
+	//срез, в который будут считаны данные
+	var rs []Record
+
+	//считывание данных в rs
+	err := gocqlx.Query(session.Query(stmts.sel.stmt), stmts.sel.names).Select(&rs)
+	if err != nil {
+		logger.Warn("select is_3000.users", zap.Error(err))
+		return false
+	}
+
+	//поиск такого же пользователя в бд по ID
+	for _, r := range rs {
+		if r.ID == strconv.Itoa(id) {
 			return true
 		}
 	}
-	//если не найдено такого же пользователя, то переходим к записи его информации в файл
 	return false
 }
 
-// Сохранение всей информации о сообщении в .txt файл
-func SaveInfo(message *tgbotapi.Message) {
+// Сохранение информации о сообщении в БД
+func SaveInfoDB(session *gocql.Session, logger *zap.Logger, message *tgbotapi.Message) {
+	//Приведение форматов данных
+	strID := strconv.Itoa(int(message.From.ID))
+	strIsBot := strconv.FormatBool(message.From.IsBot)
 
-	//Структура сохраняемых данных, инициализация объекта
-	currUser := UserInfoFS{
-		ID:           message.From.ID,
-		IsBot:        message.From.IsBot,
-		FirstName:    message.From.FirstName,
-		LastName:     message.From.LastName,
-		UserName:     message.From.UserName,
-		LanguageCode: message.From.LanguageCode,
-	}
-
-	//конвертация в формат json
-	info, err := json.Marshal(currUser)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	//Открытие/создание файла для сохранения, файл может быть только дополнен, не переписан
-	saveFile, err := os.OpenFile("savedInfo.txt", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	//запись информации в файл с добавлением переноса строки
-	if _, err := saveFile.WriteString(string(info) + "\n"); err != nil {
-		log.Fatal(err)
-	}
-
-	//закрытие файла
-	saveFile.Close()
+	//Запрос на вставку
+	insertQuery(session, strID, strIsBot, message.From.FirstName,
+		message.From.LastName, message.From.UserName, message.From.LanguageCode, logger)
 }

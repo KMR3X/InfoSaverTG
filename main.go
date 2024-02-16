@@ -90,7 +90,7 @@ func main() {
 		log.Printf("[%s] %s", update.Message.From.UserName, update.Message.Text)
 
 		//Проверка на наличие пользователя в бд, если нет - сохранение его данных
-		if selectQuery(session, logger, int(update.Message.From.ID)) == true {
+		if selectQuery(session, logger, int(update.Message.From.ID)) {
 			msgText = "Такой пользователь уже существует. "
 		} else {
 			SaveInfoDB(session, logger, update.Message)

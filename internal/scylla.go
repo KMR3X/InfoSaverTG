@@ -92,21 +92,24 @@ func InsertQuery(session *gocql.Session, user Record) {
 
 // Запрос показа данных
 func SelectQuery(session *gocql.Session, id string) bool {
-	//срез, в который будут считаны данные
-	var rs []Rec
+	//Переменная для хранения считанной строки
+	var record Rec
 
-	//считывание данных в rs
-	err := gocqlx.Query(session.Query(stmts.sel.stmt), stmts.sel.names).Select(&rs)
-	if err != nil {
-		log.Println("select is_3000.users", err)
-		return false
-	}
+	scanner := gocqlx.Query(session.Query(stmts.sel.stmt), stmts.sel.names).Iter().Scanner()
+	for scanner.Next() {
+		err := scanner.Scan(&record.ID, &record.IsBot, &record.FirstName, &record.LastName, &record.UserName, &record.LanguageCode)
+		if err != nil {
+			log.Fatal(err)
+		}
 
-	//поиск такого же пользователя в бд по ID
-	for _, r := range rs {
-		if r.ID == id {
+		//проверка на совпадение
+		if record.ID == id {
 			return true
 		}
+	}
+	//Закрытие итератора
+	if err := scanner.Err(); err != nil {
+		log.Fatal(err)
 	}
 	return false
 }
